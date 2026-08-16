@@ -1,0 +1,303 @@
+local Players=game:GetService("Players")
+local HttpService=game:GetService("HttpService")
+local player=Players.LocalPlayer
+local MatchClient=require(player.PlayerGui.Client.MatchClient)
+
+local API_URL="https://chess-api.com/v1"
+local DEPTH=12
+local highlights={}
+local updateId=0
+local processing=false
+local FILES={"a","b","c","d","e","f","g","h"}
+local PIECES={Pawn="p",Knight="n",Bishop="b",Rook="r",Queen="q",King="k"}
+
+local function clearHighlights()
+	for _,v in pairs(highlights) do
+		if v then
+			v:Destroy()
+		end
+	end
+	table.clear(highlights)
+end
+
+local function algebraicToGrid(square)
+	if type(square)~="string" or #square<2 then return end
+	local file=square:sub(1,1)
+	local rank=tonumber(square:sub(2,2))
+	if not rank then return end
+	for i,v in ipairs(FILES) do
+		if v==file then
+			return 9-i,rank
+		end
+	end
+end
+
+local function findTile(board,x,y)
+	return board.tiles[x] and board.tiles[x][y]
+end
+
+local function highlightTile(tile,color)
+	if not tile then return end
+	local v=Instance.new("SelectionBox")
+	v.SurfaceColor3=color
+	v.Color3=color
+	v.SurfaceTransparency=0.25
+	v.Transparency=0
+	v.LineThickness=0.1
+	v.Adornee=tile
+	v.Parent=tile
+	table.insert(highlights,v)
+end
+
+local function getTeam(board)
+	if board.players[true]==player then return true end
+	if board.players[false]==player then return false end
+end
+
+local function buildFreshFen(board)
+	if not board or not board.boardExists then return end
+	local rows={}
+	local wk,bk=0,0
+
+	for y=8,1,-1 do
+		local row=""
+		local empty=0
+
+		for x=8,1,-1 do
+			local piece=board:getPiece({x,y})
+
+			if piece then
+				if empty>0 then
+					row..=empty
+					empty=0
+				end
+
+				local symbol=PIECES[piece.Name]
+				if not symbol then return end
+
+				if piece.Name=="King" then
+					if piece.team then
+						wk+=1
+					else
+						bk+=1
+					end
+				end
+
+				row..=(piece.team and string.upper(symbol) or string.lower(symbol))
+			else
+				empty+=1
+			end
+		end
+
+		if empty>0 then
+			row..=empty
+		end
+
+		rows[#rows+1]=row
+	end
+
+	if wk~=1 or bk~=1 then return end
+
+	local active=board.activeTeam and "w" or "b"
+	return table.concat(rows,"/").." "..active.." KQkq - 0 "..math.ceil(board.round/2)
+end
+
+local function getFreshFen(id)
+	while id==updateId do
+		local board=MatchClient.currentMatch
+
+		if not board or not board.boardExists then
+			task.wait(0.25)
+			continue
+		end
+
+		local team=getTeam(board)
+
+		if team==nil then
+			task.wait(0.25)
+			continue
+		end
+
+		if board.activeTeam~=team then
+			return
+		end
+
+		local fen=buildFreshFen(board)
+
+		if fen then
+			return fen,board
+		end
+
+		task.wait(0.1)
+	end
+end
+
+local function requestBestMove(fen)
+	local ok,response=pcall(function()
+		return request({
+			Url=API_URL,
+			Method="POST",
+			Headers={["Content-Type"]="application/json"},
+			Body=HttpService:JSONEncode({
+				fen=fen,
+				depth=DEPTH
+			})
+		})
+	end)
+
+	if not ok or not response then
+		warn("[BestMove] Request failed:",response)
+		return
+	end
+
+	if not response.Body then
+		warn("[BestMove] Empty response")
+		return
+	end
+
+	local decodeOk,data=pcall(function()
+		return HttpService:JSONDecode(response.Body)
+	end)
+
+	if not decodeOk or not data then
+		warn("[BestMove] Invalid JSON:",response.Body)
+		return
+	end
+
+	if data.type=="error" then
+		warn("[BestMove] API error:",data.error,data.text)
+		return
+	end
+
+	if not data.from or not data.to then
+		warn("[BestMove] No move returned:",response.Body)
+		return
+	end
+
+	return data
+end
+
+local function getBestMoveWithRetry(id)
+	while id==updateId do
+		local fen,board=getFreshFen(id)
+		if not fen or not board then return end
+		if id~=updateId then return end
+
+		local data=requestBestMove(fen)
+		if data then
+			return data,board
+		end
+
+		task.wait(0.35)
+	end
+end
+
+local function showBestMove(id)
+	if processing then return end
+	processing=true
+
+	local data,board=getBestMoveWithRetry(id)
+
+	if id~=updateId then
+		processing=false
+		return
+	end
+
+	if not data or not board then
+		processing=false
+		return
+	end
+
+	local currentBoard=MatchClient.currentMatch
+	if currentBoard~=board or not board.boardExists then
+		processing=false
+		return
+	end
+
+	local team=getTeam(board)
+	if team==nil or board.activeTeam~=team then
+		processing=false
+		return
+	end
+
+	local fx,fy=algebraicToGrid(data.from)
+	local tx,ty=algebraicToGrid(data.to)
+
+	if not fx or not fy or not tx or not ty then
+		warn("[BestMove] Invalid coordinates:",data.from,data.to)
+		processing=false
+		return
+	end
+
+	local fromTile=findTile(board,fx,fy)
+	local toTile=findTile(board,tx,ty)
+
+	if not fromTile or not toTile then
+		warn("[BestMove] Couldn't find tiles:",fx,fy,tx,ty)
+		processing=false
+		return
+	end
+
+	clearHighlights()
+
+	local color=Color3.fromRGB(255,204,101)
+	highlightTile(fromTile,color)
+	highlightTile(toTile,color)
+
+	print("[BestMove]",data.from.." -> "..data.to,data.san or "")
+	processing=false
+end
+
+local function update()
+	updateId+=1
+	local id=updateId
+	clearHighlights()
+
+	task.spawn(function()
+		task.wait()
+		if id~=updateId then return end
+		showBestMove(id)
+	end)
+end
+
+local oldProcessRound=MatchClient.processRound
+
+MatchClient.processRound=function(self,piece,to,info)
+	local board=MatchClient.currentMatch
+
+	if board and board.boardExists then
+		local team=getTeam(board)
+
+		if team~=nil and board.activeTeam==team then
+			clearHighlights()
+			updateId+=1
+		end
+	end
+
+	local result=oldProcessRound(self,piece,to,info)
+	local newBoard=MatchClient.currentMatch
+
+	if newBoard and newBoard.boardExists then
+		local team=getTeam(newBoard)
+
+		if team~=nil and newBoard.activeTeam==team then
+			update()
+		end
+	end
+
+	return result
+end
+
+game.ReplicatedStorage.Connections.StartGame.OnClientEvent:Connect(update)
+
+game.ReplicatedStorage.Connections.EndGame.OnClientEvent:Connect(function()
+	updateId+=1
+	processing=false
+	clearHighlights()
+end)
+
+task.defer(function()
+	if MatchClient.currentMatch then
+		update()
+	end
+end)
