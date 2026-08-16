@@ -1,5 +1,6 @@
 local Players=game:GetService("Players")
 local HttpService=game:GetService("HttpService")
+local RunService=game:GetService("RunService")
 local player=Players.LocalPlayer
 local MatchClient=require(player.PlayerGui.Client.MatchClient)
 
@@ -12,13 +13,91 @@ local states={}
 local FILES={"a","b","c","d","e","f","g","h"}
 local PIECES={Pawn="p",Knight="n",Bishop="b",Rook="r",Queen="q",King="k"}
 
+local highlightConnection
+
 local function clearHighlights()
+	if highlightConnection then
+		highlightConnection:Disconnect()
+		highlightConnection=nil
+	end
+
 	for _,v in pairs(highlights) do
 		if v then
 			v:Destroy()
 		end
 	end
+
 	table.clear(highlights)
+end
+
+local function lerpColor(a,b,t)
+	return a:Lerp(b,t)
+end
+
+local function gradientColor(colors,t)
+	local count=#colors
+	local pos=(t%(count))/1
+	local index=math.floor(pos)+1
+	local nextIndex=index%count+1
+	local alpha=pos-math.floor(pos)
+
+	return lerpColor(colors[index],colors[nextIndex],alpha)
+end
+
+local function highlightTile(tile,kind)
+	if not tile then return end
+
+	local v=Instance.new("SelectionBox")
+	v.SurfaceTransparency=0.2
+	v.Transparency=0
+	v.LineThickness=0.12
+	v.Adornee=tile
+	v.Parent=tile
+
+	table.insert(highlights,v)
+
+	if not highlightConnection then
+		local start=os.clock()
+
+		highlightConnection=RunService.RenderStepped:Connect(function()
+			if #highlights==0 then
+				highlightConnection:Disconnect()
+				highlightConnection=nil
+				return
+			end
+
+			local t=(os.clock()-start)*0.35
+
+			for i,h in ipairs(highlights) do
+				if h and h.Parent then
+					local colors
+
+					if h:GetAttribute("kind")=="from" then
+						colors={
+							Color3.fromRGB(0,255,255),
+							Color3.fromRGB(80,120,255),
+							Color3.fromRGB(180,70,255),
+							Color3.fromRGB(0,255,255)
+						}
+					else
+						colors={
+							Color3.fromRGB(255,230,70),
+							Color3.fromRGB(255,140,40),
+							Color3.fromRGB(255,70,170),
+							Color3.fromRGB(255,230,70)
+						}
+					end
+
+					local color=gradientColor(colors,t+(i-1)*0.15)
+
+					h.Color3=color
+					h.SurfaceColor3=color
+				end
+			end
+		end)
+	end
+
+	v:SetAttribute("kind",kind or "to")
 end
 
 local function algebraicToGrid(square)
@@ -37,7 +116,8 @@ local function algebraicToGrid(square)
 end
 
 local function gridToAlgebraic(x,y)
-	if not x or not y or x<1 or x>8 or y<1 or y>8 then return end
+	if type(x)~="number" or type(y)~="number" then return end
+	if x<1 or x>8 or y<1 or y>8 then return end
 	return FILES[9-x]..y
 end
 
@@ -45,7 +125,7 @@ local function findTile(board,x,y)
 	return board.tiles[x] and board.tiles[x][y]
 end
 
-local function highlightTile(tile,color)
+--[[local function highlightTile(tile,color)
 	if not tile then return end
 
 	local v=Instance.new("SelectionBox")
@@ -58,7 +138,7 @@ local function highlightTile(tile,color)
 	v.Parent=tile
 
 	table.insert(highlights,v)
-end
+end]]
 
 local function getTeam(board)
 	if not board or not board.players then return end
@@ -71,14 +151,11 @@ local function getState(board)
 
 	if not states[key] then
 		states[key]={
-			K=false,
-			Q=false,
-			k=false,
-			q=false,
-			ep="-",
 			half=0,
 			full=1,
+			ep="-",
 			snapshot=nil,
+			lastMover=nil,
 			ready=false
 		}
 	end
@@ -90,8 +167,9 @@ local function getSnapshot(board)
 	if not board or not board.boardExists then return end
 
 	local snap={}
-	local wk,bk=0,0
-	local count=0
+	local whiteKing=0
+	local blackKing=0
+	local pieces=0
 
 	for y=1,8 do
 		for x=1,8 do
@@ -101,218 +179,232 @@ local function getSnapshot(board)
 				local key=x..":"..y
 
 				snap[key]={
+					ref=piece,
 					name=piece.Name,
 					team=piece.team,
 					x=x,
-					y=y
+					y=y,
+					unmoved=type(piece.isUnmoved)=="function" and piece:isUnmoved() or piece.unmoved==true
 				}
 
-				count+=1
+				pieces+=1
 
 				if piece.Name=="King" then
 					if piece.team then
-						wk+=1
+						whiteKing+=1
 					else
-						bk+=1
+						blackKing+=1
 					end
 				end
 			end
 		end
 	end
 
-	return snap,wk,bk,count
+	return snap,whiteKing,blackKing,pieces
 end
 
-local function getPieceAt(snap,x,y)
-	return snap and snap[x..":"..y]
+local function getPieceAt(snapshot,x,y)
+	return snapshot and snapshot[x..":"..y]
 end
 
 local function samePiece(a,b)
-	return a and b and a.name==b.name and a.team==b.team
+	if not a or not b then return false end
+	return a.ref==b.ref
 end
 
-local function getChanges(before,after)
-	local removed={}
-	local added={}
+local function getMovedPiece(before,after,mover)
+	if not before or not after or mover==nil then return end
 
-	for key,piece in pairs(before) do
-		local current=after[key]
+	local oldPiece
+	local newPiece
+	local candidates=0
 
-		if not current then
-			removed[#removed+1]=piece
-		elseif not samePiece(piece,current) then
-			removed[#removed+1]=piece
-			added[#added+1]=current
-		end
-	end
-
-	for key,piece in pairs(after) do
-		if not before[key] then
-			added[#added+1]=piece
-		end
-	end
-
-	return removed,added
-end
-
-local function findMovedPiece(before,after,team)
-	local candidates={}
-
-	for _,old in pairs(before) do
-		if old.team==team then
-			local current=getPieceAt(after,old.x,old.y)
+	for key,old in pairs(before) do
+		if old.team==mover then
+			local current=after[key]
 
 			if not current or not samePiece(old,current) then
-				candidates[#candidates+1]=old
-			end
-		end
-	end
-
-	for _,old in ipairs(candidates) do
-		for _,new in pairs(after) do
-			if new.team==team and old.name==new.name then
-				if old.x~=new.x or old.y~=new.y then
-					return old,new
+				if not oldPiece then
+					oldPiece=old
+				else
+					candidates+=1
 				end
 			end
 		end
 	end
+
+	for key,new in pairs(after) do
+		if new.team==mover then
+			local old=before[key]
+
+			if not old or not samePiece(old,new) then
+				if not newPiece then
+					newPiece=new
+				else
+					candidates+=1
+				end
+			end
+		end
+	end
+
+	if not oldPiece or not newPiece then return end
+	if candidates>0 then return end
+
+	return oldPiece,newPiece
 end
 
-local function hasPiece(snap,x,y,name,team)
-	local piece=getPieceAt(snap,x,y)
+local function wasCapture(before,after,old,new)
+	if not before or not after or not old or not new then return false end
 
-	return piece
-		and piece.name==name
-		and piece.team==team
+	local destination=before[new.x..":"..new.y]
+
+	if destination and destination.team~=old.team then
+		return true
+	end
+
+	local removed=0
+
+	for key,piece in pairs(before) do
+		if not after[key] and not (piece.x==old.x and piece.y==old.y) then
+			removed+=1
+		end
+	end
+
+	return removed>0
 end
 
-local function refreshCastling(state,snap)
-	state.K=hasPiece(snap,8,1,"Rook",true) and hasPiece(snap,5,1,"King",true) or false
-	state.Q=hasPiece(snap,1,1,"Rook",true) and hasPiece(snap,5,1,"King",true) or false
-	state.k=hasPiece(snap,8,8,"Rook",false) and hasPiece(snap,5,8,"King",false) or false
-	state.q=hasPiece(snap,1,8,"Rook",false) and hasPiece(snap,5,8,"King",false) or false
+local function getCastling(board)
+	local wk=board:getPiece({5,1})
+	local wra=board:getPiece({8,1})
+	local wrh=board:getPiece({1,1})
+	local bk=board:getPiece({5,8})
+	local bra=board:getPiece({8,8})
+	local brh=board:getPiece({1,8})
+
+	local function unmoved(piece,team,name)
+		if not piece or piece.team~=team or piece.Name~=name then
+			return false
+		end
+
+		if type(piece.isUnmoved)=="function" then
+			return piece:isUnmoved()==true
+		end
+
+		return piece.unmoved==true
+	end
+
+	local v=""
+
+	if unmoved(wk,true,"King") and unmoved(wra,true,"Rook") then
+		v="K"
+	end
+
+	if unmoved(wk,true,"King") and unmoved(wrh,true,"Rook") then
+		v=v.."Q"
+	end
+
+	if unmoved(bk,false,"King") and unmoved(bra,false,"Rook") then
+		v=v.."k"
+	end
+
+	if unmoved(bk,false,"King") and unmoved(brh,false,"Rook") then
+		v=v.."q"
+	end
+
+	return v=="" and "-" or v
 end
 
-local function updateCastling(state,before,after)
-	if not before or not after then return end
+local function getEnPassant(after,old,new)
+	if not old or not new or old.name~="Pawn" then return "-" end
 
-	if state.K and not hasPiece(after,8,1,"Rook",true) then
-		state.K=false
+	if old.x~=new.x then return "-" end
+	if math.abs(new.y-old.y)~=2 then return "-" end
+
+	local dir=old.team and 1 or -1
+	local targetY=old.y+dir
+
+	if targetY<1 or targetY>8 then
+		return "-"
 	end
 
-	if state.Q and not hasPiece(after,1,1,"Rook",true) then
-		state.Q=false
+	for _,x in ipairs({new.x-1,new.x+1}) do
+		if x>=1 and x<=8 then
+			local enemy=getPieceAt(after,x,new.y)
+
+			if enemy and enemy.name=="Pawn" and enemy.team~=old.team then
+				local target=gridToAlgebraic(new.x,targetY)
+
+				if target then
+					return target
+				end
+			end
+		end
 	end
 
-	if state.k and not hasPiece(after,8,8,"Rook",false) then
-		state.k=false
-	end
-
-	if state.q and not hasPiece(after,1,8,"Rook",false) then
-		state.q=false
-	end
-
-	local wkBefore=hasPiece(before,5,1,"King",true)
-	local wkAfter=hasPiece(after,5,1,"King",true)
-
-	local bkBefore=hasPiece(before,5,8,"King",false)
-	local bkAfter=hasPiece(after,5,8,"King",false)
-
-	if wkBefore and not wkAfter then
-		state.K=false
-		state.Q=false
-	end
-
-	if bkBefore and not bkAfter then
-		state.k=false
-		state.q=false
-	end
+	return "-"
 end
 
-local function updateMoveState(board,before,after)
+local function updateMoveState(board,before,after,mover)
+	if not board or not before or not after or mover==nil then return end
+
 	local state=getState(board)
-
-	if not before or not after then
-		state.snapshot=after
-		return
-	end
-
-	local team=board.activeTeam
-	local old,new=findMovedPiece(before,after,team)
-	local removed,added=getChanges(before,after)
-
-	updateCastling(state,before,after)
+	local old,new=getMovedPiece(before,after,mover)
 
 	state.ep="-"
 
 	if not old or not new then
 		state.snapshot=after
+		state.lastMover=mover
 		return
 	end
 
-	local capture=#removed>#1
+	local capture=wasCapture(before,after,old,new)
 
-	if old.name=="Pawn" then
-		state.half=0
-
-		if math.abs(new.y-old.y)==2 then
-			state.ep=gridToAlgebraic(old.x,(old.y+new.y)/2)
-		end
-	elseif capture then
+	if old.name=="Pawn" or capture then
 		state.half=0
 	else
-		state.half+=1
+		state.half=(tonumber(state.half) or 0)+1
 	end
 
-	if old.team==false then
-		state.full+=1
+	state.ep=getEnPassant(after,old,new)
+
+	if mover==false then
+		state.full=(tonumber(state.full) or 1)+1
 	end
 
+	state.lastMover=mover
 	state.snapshot=after
+	state.ready=true
 end
 
 local function initializeState(board)
 	if not board or not board.boardExists then return end
 
 	local state=getState(board)
-	local snap,wk,bk,count=getSnapshot(board)
 
-	if not snap or wk~=1 or bk~=1 then
+	if state.ready and state.snapshot then
 		return
 	end
 
-	if state.ready then
+	local snapshot,wk,bk=getSnapshot(board)
+
+	if not snapshot or wk~=1 or bk~=1 then
 		return
 	end
 
-	state.snapshot=snap
-	state.full=math.max(1,tonumber(board.round) and math.ceil(board.round/2) or 1)
-	state.half=0
+	state.snapshot=snapshot
+	state.half=tonumber(board.fiftyMoveCounter) or 0
+	state.full=math.max(1,math.ceil((tonumber(board.round) or 1)/2))
 	state.ep="-"
-
-	refreshCastling(state,snap)
-
 	state.ready=true
-end
-
-local function getCastling(state)
-	local v=""
-
-	if state.K then v="K" end
-	if state.Q then v..="Q" end
-	if state.k then v..="k" end
-	if state.q then v..="q" end
-
-	return v=="" and "-" or v
 end
 
 local function buildFen(board)
 	if not board or not board.boardExists then return end
 
-	local snap,wk,bk=getSnapshot(board)
+	local snapshot,wk,bk=getSnapshot(board)
 
-	if not snap or wk~=1 or bk~=1 then
+	if not snapshot or wk~=1 or bk~=1 then
 		return
 	end
 
@@ -320,7 +412,10 @@ local function buildFen(board)
 
 	if not state.ready then
 		initializeState(board)
-		state=getState(board)
+	end
+
+	if not state.ready then
+		return
 	end
 
 	local rows={}
@@ -330,11 +425,11 @@ local function buildFen(board)
 		local empty=0
 
 		for x=8,1,-1 do
-			local piece=snap[x..":"..y]
+			local piece=snapshot[x..":"..y]
 
 			if piece then
 				if empty>0 then
-					row..=empty
+					row..=tostring(empty)
 					empty=0
 				end
 
@@ -351,14 +446,14 @@ local function buildFen(board)
 		end
 
 		if empty>0 then
-			row..=empty
+			row..=tostring(empty)
 		end
 
 		rows[#rows+1]=row
 	end
 
 	local active=board.activeTeam and "w" or "b"
-	local castling=getCastling(state)
+	local castling=getCastling(board)
 	local ep=state.ep or "-"
 	local half=math.max(0,tonumber(state.half) or 0)
 	local full=math.max(1,tonumber(state.full) or 1)
@@ -377,25 +472,32 @@ local function validateFen(fen)
 	if active~="w" and active~="b" then return false end
 	if castling~="-" and not castling:match("^[KQkq]+$") then return false end
 	if ep~="-" and not ep:match("^[a-h][36]$") then return false end
-	if not tonumber(half) or not tonumber(full) then return false end
-	if tonumber(half)<0 or tonumber(full)<1 then return false end
 
-	local rows=string.split(board,"/")
+	half=tonumber(half)
+	full=tonumber(full)
 
-	if #rows~=8 then return false end
+	if not half or not full then return false end
+	if half<0 or full<1 then return false end
+
+	local ranks={}
+	for rank in board:gmatch("[^/]+") do
+		ranks[#ranks+1]=rank
+	end
+
+	if #ranks~=8 then return false end
 
 	local wk,bk=0,0
 
-	for rank,row in ipairs(rows) do
+	for _,rank in ipairs(ranks) do
 		local count=0
 
-		for i=1,#row do
-			local c=row:sub(i, i)
+		for i=1,#rank do
+			local c=rank:sub(i,i)
 
 			if c:match("%d") then
 				local n=tonumber(c)
 
-				if n<1 or n>8 then
+				if not n or n<1 or n>8 then
 					return false
 				end
 
@@ -408,10 +510,6 @@ local function validateFen(fen)
 				elseif c=="k" then
 					bk+=1
 				end
-
-				if (rank==1 or rank==8) and c:lower()=="p" then
-					return false
-				end
 			else
 				return false
 			end
@@ -422,17 +520,7 @@ local function validateFen(fen)
 		end
 	end
 
-	if wk~=1 or bk~=1 then
-		return false
-	end
-
-	if castling~="-" then
-		if castling:find("K",1,true) and not board:find("K") then
-			return false
-		end
-	end
-
-	return true
+	return wk==1 and bk==1
 end
 
 local function getFreshFen(id)
@@ -455,9 +543,9 @@ local function getFreshFen(id)
 			return
 		end
 
-		local snap,wk,bk=getSnapshot(board)
+		local snapshot,wk,bk=getSnapshot(board)
 
-		if snap and wk==1 and bk==1 then
+		if snapshot and wk==1 and bk==1 then
 			local state=getState(board)
 
 			if not state.ready then
@@ -467,7 +555,7 @@ local function getFreshFen(id)
 			local fen=buildFen(board)
 
 			if fen and validateFen(fen) then
-				return fen,board,snap
+				return fen,board,snapshot
 			end
 		end
 
@@ -495,7 +583,7 @@ local function requestBestMove(fen)
 		return
 	end
 
-	if not response or not response.Body then
+	if not response or type(response.Body)~="string" or response.Body=="" then
 		warn("[BestMove] Empty response")
 		return
 	end
@@ -522,6 +610,22 @@ local function requestBestMove(fen)
 	return data
 end
 
+local function recoverState(board)
+	if not board or not board.boardExists then return end
+
+	local snapshot,wk,bk=getSnapshot(board)
+
+	if not snapshot or wk~=1 or bk~=1 then return end
+
+	local state=getState(board)
+
+	state.snapshot=snapshot
+	state.ep="-"
+	state.half=tonumber(board.fiftyMoveCounter) or state.half or 0
+	state.full=math.max(1,math.ceil((tonumber(board.round) or 1)/2))
+	state.ready=true
+end
+
 local function getBestMoveWithRetry(id)
 	local rejected={}
 	local attempts=0
@@ -529,16 +633,13 @@ local function getBestMoveWithRetry(id)
 	while id==updateId do
 		local fen,board,snapshot=getFreshFen(id)
 
-		if not fen or not board then
-			return
-		end
-
-		if id~=updateId then
+		if not fen or not board or not snapshot then
 			return
 		end
 
 		if rejected[fen] then
-			task.wait(0.25)
+			recoverState(board)
+			task.wait(0.2)
 			continue
 		end
 
@@ -551,19 +652,9 @@ local function getBestMoveWithRetry(id)
 		rejected[fen]=true
 		attempts+=1
 
-		local current=MatchClient.currentMatch
-
-		if current and current==board and current.boardExists then
-			local fresh=getSnapshot(current)
-
-			if fresh then
-				local state=getState(current)
-				state.snapshot=fresh
-
-				if attempts>=2 then
-					state.ep="-"
-				end
-			end
+		if attempts>=3 then
+			recoverState(board)
+			attempts=0
 		end
 
 		task.wait(math.min(0.25+attempts*0.15,1))
@@ -601,25 +692,17 @@ local function showBestMove(id)
 		return
 	end
 
-	local currentSnapshot=getSnapshot(board)
-
-	if not currentSnapshot then
-		processing=false
-		return
-	end
-
 	local fx,fy=algebraicToGrid(data.from)
 	local tx,ty=algebraicToGrid(data.to)
 
 	if not fx or not fy or not tx or not ty then
-		warn("[BestMove] Invalid coordinates:",data.from,data.to)
 		processing=false
 		return
 	end
 
-	local fromPiece=snapshot[fx..":"..fy]
+	local piece=snapshot[fx..":"..fy]
 
-	if not fromPiece then
+	if not piece or piece.team~=team then
 		processing=false
 		return
 	end
@@ -628,17 +711,14 @@ local function showBestMove(id)
 	local toTile=findTile(board,tx,ty)
 
 	if not fromTile or not toTile then
-		warn("[BestMove] Couldn't find tiles:",fx,fy,tx,ty)
 		processing=false
 		return
 	end
 
 	clearHighlights()
 
-	local color=Color3.fromRGB(255,204,101)
-
-	highlightTile(fromTile,color)
-	highlightTile(toTile,color)
+	highlightTile(fromTile,"from")
+highlightTile(toTile,"to")
 
 	print("[BestMove]",data.from.." -> "..data.to,data.san or "")
 
@@ -655,9 +735,7 @@ local function update()
 	task.spawn(function()
 		task.wait()
 
-		if id~=updateId then
-			return
-		end
+		if id~=updateId then return end
 
 		showBestMove(id)
 	end)
@@ -668,38 +746,43 @@ local oldProcessRound=MatchClient.processRound
 MatchClient.processRound=function(self,piece,to,info)
 	local board=MatchClient.currentMatch
 	local before
-	local oldTeam
+	local mover
 
 	if board and board.boardExists then
 		initializeState(board)
-
 		before=getSnapshot(board)
-		oldTeam=board.activeTeam
+		mover=board.activeTeam
 
-		if getTeam(board)==oldTeam then
+		local team=getTeam(board)
+
+		if team~=nil and board.activeTeam==team then
 			clearHighlights()
 			updateId+=1
 		end
 	end
 
-	local result=oldProcessRound(self,piece,to,info)
+	local ok,result=pcall(function()
+		return oldProcessRound(self,piece,to,info)
+	end)
+
+	if not ok then
+		processing=false
+		warn("[BestMove] processRound:",result)
+		return
+	end
 
 	local newBoard=MatchClient.currentMatch
 
 	if newBoard and newBoard.boardExists then
 		local after=getSnapshot(newBoard)
 
-		if newBoard==board and before and after then
-			local state=getState(newBoard)
-
-			if state.snapshot then
-				updateMoveState(newBoard,before,after)
-			else
-				state.snapshot=after
-			end
+		if newBoard==board and before and after and mover~=nil then
+			updateMoveState(newBoard,before,after,mover)
 		elseif after then
 			local state=getState(newBoard)
 			state.snapshot=after
+			state.ready=true
+			state.ep="-"
 		end
 
 		local team=getTeam(newBoard)
@@ -732,11 +815,15 @@ if connections then
 					local board=MatchClient.currentMatch
 
 					if board and board.boardExists then
-						local snap,wk,bk=getSnapshot(board)
+						local snapshot,wk,bk=getSnapshot(board)
 
-						if snap and wk==1 and bk==1 then
+						if snapshot and wk==1 and bk==1 then
 							initializeState(board)
-							update()
+
+							if getTeam(board)==board.activeTeam then
+								update()
+							end
+
 							return
 						end
 					end
@@ -764,9 +851,9 @@ task.defer(function()
 		local board=MatchClient.currentMatch
 
 		if board and board.boardExists then
-			local snap,wk,bk=getSnapshot(board)
+			local snapshot,wk,bk=getSnapshot(board)
 
-			if snap and wk==1 and bk==1 then
+			if snapshot and wk==1 and bk==1 then
 				initializeState(board)
 
 				if getTeam(board)==board.activeTeam then
